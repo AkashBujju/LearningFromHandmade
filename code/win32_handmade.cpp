@@ -1,6 +1,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <xinput.h>
+#include <dsound.h>
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -31,7 +32,7 @@ typedef struct Win32WindowDimension {
 #define X_INPUT_GET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_STATE *pState)
 typedef X_INPUT_GET_STATE(x_input_get_state);
 X_INPUT_GET_STATE(XInputGetStateStub) {
-	return 0;
+	return ERROR_DEVICE_NOT_CONNECTED;
 }
 static x_input_get_state *XInputGetState_ = XInputGetStateStub;
 #define XInputGetState XInputGetState_
@@ -40,17 +41,24 @@ static x_input_get_state *XInputGetState_ = XInputGetStateStub;
 #define X_INPUT_SET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_VIBRATION *pVibration)
 typedef X_INPUT_SET_STATE(x_input_set_state);
 X_INPUT_SET_STATE(XInputSetStateStub) {
-	return 0;
+	return ERROR_DEVICE_NOT_CONNECTED;
 }
 static x_input_set_state *XInputSetState_ = XInputSetStateStub;
 #define XInputSetState XInputSetState_
 
+/* DirectSound */
+#define DIRECT_SOUND_CREATE(name) HRESULT WINAPI name(LPCGUID pcGuidDevice, LPDIRECTSOUND *ppDS, LPUNKNOWN pUnkOuter)
+typedef DIRECT_SOUND_CREATE(direct_sound_create);
+
+/* Functions */
 static LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param);
 static void resize_dib_section(Win32OffScreenBuffer *buffer, int width, int height);
-static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer buffer, int x, int y, int width, int height);
-static void render_something(Win32OffScreenBuffer buffer, int x, int y);
+static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer *buffer, int x, int y, int width, int height);
+static void render_something(Win32OffScreenBuffer *buffer, int x, int y);
 static Win32WindowDimension get_window_dimension(HWND window);
 static void load_x_input();
+static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size);
+/* Functions */
 
 /* Global variables */
 static Win32OffScreenBuffer buffer;
@@ -59,7 +67,7 @@ static Win32OffScreenBuffer buffer;
 static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int show_code) {
 	load_x_input();
 
-	WNDCLASS window_class = {};
+	WNDCLASSA window_class = {};
 	window_class.style = CS_HREDRAW|CS_VREDRAW;
 	window_class.lpfnWndProc = win32_main_window_callback;
 	window_class.hInstance = instance;
@@ -73,6 +81,8 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 			int x_offset = 0;
 			MSG msg;
 			running = true;
+			Win32InitSound(window_handle, 48000, 48000 * sizeof(int16) * 2);
+
 			while(running) {
 				while(PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
 					if(msg.message == WM_QUIT)
@@ -114,13 +124,12 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 					}
 				}
 
-				render_something(buffer, x_offset, 0);
+				render_something(&buffer, x_offset, 0);
 
 				Win32WindowDimension win32_window_dimension = get_window_dimension(window_handle);
 				HDC device_context = GetDC(window_handle);
-				win32_update_window(device_context, win32_window_dimension.width, win32_window_dimension.height, buffer, 0, 0, win32_window_dimension.width, win32_window_dimension.height);
+				win32_update_window(device_context, win32_window_dimension.width, win32_window_dimension.height, &buffer, 0, 0, win32_window_dimension.width, win32_window_dimension.height);
 				ReleaseDC(window_handle, device_context);
-
 			}
 		}
 	}
@@ -201,17 +210,17 @@ static void resize_dib_section(Win32OffScreenBuffer *buffer, int width, int heig
 	buffer->pitch = width * buffer->bytes_per_pixel;
 }
 
-static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer buffer, int x, int y, int width, int height) {
-	StretchDIBits(device_context, 0, 0, window_width, window_height, 0, 0, buffer.width, buffer.height, buffer.memory, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
+static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer *buffer, int x, int y, int width, int height) {
+	StretchDIBits(device_context, 0, 0, window_width, window_height, 0, 0, buffer->width, buffer->height, buffer->memory, &buffer->info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-static void render_something(Win32OffScreenBuffer buffer, int x, int y) {
-	int width = buffer.width;
-	int height = buffer.height;
+static void render_something(Win32OffScreenBuffer *buffer, int x, int y) {
+	int width = buffer->width;
+	int height = buffer->height;
 
 	// Register: xx RR GG BB 
 	// Memory  : BB GG RR xx
-	uint8* row = (uint8*) buffer.memory;
+	uint8* row = (uint8*) buffer->memory;
 	for(int i = 0; i < height; ++i) {
 		uint32* pixel = (uint32*) row;
 		for(int j = 0; j < width; ++j) {
@@ -221,7 +230,7 @@ static void render_something(Win32OffScreenBuffer buffer, int x, int y) {
 			pixel += 1;
 		}
 
-		row += buffer.pitch;
+		row += buffer->pitch;
 	}
 }
 
@@ -236,9 +245,73 @@ static Win32WindowDimension get_window_dimension(HWND window) {
 }
 
 static void load_x_input() {
-	HMODULE x_input_library = LoadLibrary("xinput1_3.dll");
+	HMODULE x_input_library = LoadLibraryA("xinput1_4.dll");
+	if(!x_input_library) {
+		x_input_library = LoadLibraryA("xinput1_3.dll");
+	}
+
 	if(x_input_library) {
 		XInputGetState = (x_input_get_state*) GetProcAddress(x_input_library, "XInputGetState");
 		XInputSetState = (x_input_set_state*) GetProcAddress(x_input_library, "XInputSetState");
+	}
+}
+
+static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size) {
+	/* Load the library. */
+	HMODULE d_sound_library = LoadLibraryA("dsound.dll");
+
+	if(d_sound_library) {
+		/* Get the direct sound object. */
+		direct_sound_create *DirectSoundCreate = (direct_sound_create*) GetProcAddress(d_sound_library, "DirectSoundCreate");
+
+		LPDIRECTSOUND direct_sound;
+		if(DirectSoundCreate && SUCCEEDED(DirectSoundCreate(0, &direct_sound, 0))) {
+			WAVEFORMATEX wave_format = {};
+			wave_format.wFormatTag = WAVE_FORMAT_PCM;
+			wave_format.nChannels = 2;
+			wave_format.nSamplesPerSec = samples_per_sec;
+			wave_format.wBitsPerSample = 16;
+			wave_format.nBlockAlign = (wave_format.nChannels * wave_format.wBitsPerSample) / 8;
+			wave_format.nAvgBytesPerSec = wave_format.nSamplesPerSec * wave_format.nBlockAlign;
+			wave_format.cbSize = 0;
+
+			if(SUCCEEDED(direct_sound->SetCooperativeLevel(window, DSSCL_PRIORITY))) {
+				DSBUFFERDESC buffer_description = {};
+				buffer_description.dwSize = sizeof(buffer_description);
+				buffer_description.dwFlags = DSBCAPS_PRIMARYBUFFER;
+
+				/* Create a primary buffer. */
+				LPDIRECTSOUNDBUFFER primary_buffer;
+				if(SUCCEEDED(direct_sound->CreateSoundBuffer(&buffer_description, &primary_buffer, 0))) {
+					if(SUCCEEDED(primary_buffer->SetFormat(&wave_format))) {
+						OutputDebugStringA("HERE\n");
+					}
+					else {
+						/* Could not set format. */
+					}
+				}
+			}
+			else {
+				/* Could not set cooperative_level. */
+			}
+
+			/* Create a secondary primary buffer. */
+			DSBUFFERDESC buffer_description = {};
+			buffer_description.dwSize = sizeof(buffer_description);
+			buffer_description.dwFlags = 0;
+			buffer_description.dwBufferBytes = buffer_size;
+			buffer_description.lpwfxFormat = &wave_format;
+			LPDIRECTSOUNDBUFFER secondary_buffer;
+			if(SUCCEEDED(direct_sound->CreateSoundBuffer(&buffer_description, &secondary_buffer, 0))) {
+				/* Start playing it! */
+				OutputDebugStringA("HERE\n");
+			}
+		}
+		else {
+			/* Could not create DirectSound object! */
+		}
+	}
+	else {
+		/* Could not load the d_sound_library. */
 	}
 }
