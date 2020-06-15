@@ -62,6 +62,7 @@ static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size
 
 /* Global variables */
 static Win32OffScreenBuffer buffer;
+static LPDIRECTSOUNDBUFFER secondary_buffer;
 /* Global variables */
 
 static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int show_code) {
@@ -78,10 +79,25 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 		resize_dib_section(&buffer, 800, 600);
 
 		if(window_handle) {
-			int x_offset = 0;
 			MSG msg;
 			running = true;
-			Win32InitSound(window_handle, 48000, 48000 * sizeof(int16) * 2);
+
+			/* Graphics test */
+			int x_offset = 0;
+			/* Graphics test */
+
+			/* Sound test */
+			int samples_per_second = 48000;
+			int tone_hz = 256;
+			uint32 running_sample_index = 0;
+			int square_wave_period = samples_per_second / tone_hz;
+			int half_square_wave_period = square_wave_period / 2;
+			int bytes_per_sample = sizeof(int16) * 2;
+			int secondary_buffer_size = samples_per_second * bytes_per_sample;
+			int tone_volume = 5000;
+			Win32InitSound(window_handle, samples_per_second, secondary_buffer_size);
+			secondary_buffer->Play(0, 0, DSBPLAY_LOOPING);
+			/* Sound test */
 
 			while(running) {
 				while(PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
@@ -125,6 +141,51 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 				}
 
 				render_something(&buffer, x_offset, 0);
+
+				/* DirectSound test */
+				{
+					DWORD play_cursor;
+					DWORD write_cursor;
+					if(SUCCEEDED(secondary_buffer->GetCurrentPosition(&play_cursor, &write_cursor))) {
+						DWORD byte_to_lock = running_sample_index * bytes_per_sample % secondary_buffer_size;
+						DWORD bytes_to_write;
+						if(byte_to_lock > play_cursor) {
+							bytes_to_write = secondary_buffer_size - byte_to_lock;
+							bytes_to_write += play_cursor;
+						}
+						else {
+							bytes_to_write = play_cursor - byte_to_lock;
+						}
+						
+						void *region_1, *region_2;
+						DWORD region_1_size, region_2_size;
+
+						if(SUCCEEDED(secondary_buffer->Lock(
+										byte_to_lock, bytes_to_write, &region_1, &region_1_size, &region_2, &region_2_size, 0)))
+						{
+							int16* sample_out;
+
+							sample_out = (int16*) region_1;
+							DWORD region_1_sample_count = region_1_size / bytes_per_sample;
+							for(DWORD sample_index = 0; sample_index < region_1_sample_count; ++sample_index) {
+								int16 sample_value = ((running_sample_index++ / half_square_wave_period) % 2) ? tone_volume : -tone_volume;
+								*sample_out++ = sample_value; 
+								*sample_out++ = sample_value; 
+							}
+
+							DWORD region_2_sample_count = region_2_size / bytes_per_sample;
+							sample_out = (int16*) region_2;
+							for(DWORD sample_index = 0; sample_index < region_2_sample_count; ++sample_index) {
+								int16 sample_value = ((running_sample_index++ / half_square_wave_period) % 2) ? tone_volume : -tone_volume;
+								*sample_out++ = sample_value; 
+								*sample_out++ = sample_value;
+							}
+
+							secondary_buffer->Unlock(region_1, region_1_size, region_2, region_2_size);
+						}
+					}
+				}
+				/* DirectSound test */
 
 				Win32WindowDimension win32_window_dimension = get_window_dimension(window_handle);
 				HDC device_context = GetDC(window_handle);
@@ -301,7 +362,6 @@ static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size
 			buffer_description.dwFlags = 0;
 			buffer_description.dwBufferBytes = buffer_size;
 			buffer_description.lpwfxFormat = &wave_format;
-			LPDIRECTSOUNDBUFFER secondary_buffer;
 			if(SUCCEEDED(direct_sound->CreateSoundBuffer(&buffer_description, &secondary_buffer, 0))) {
 				/* Start playing it! */
 				OutputDebugStringA("HERE\n");
