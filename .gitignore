@@ -5,3 +5,7 @@
 *.obj
 *.db
 *.suo
+*.db-shm
+*.db-wal
+*.opendb
+*.sln

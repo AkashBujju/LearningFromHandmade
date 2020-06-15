@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <stdint.h>
+#include <xinput.h>
 
 typedef uint8_t uint8;
 typedef uint16_t uint16;
@@ -11,29 +12,62 @@ typedef int32_t int32;
 typedef int64_t int64;
 
 static bool running;
-static BITMAPINFO bitmap_info;
-static void *bitmap_memory;
-static int bitmap_width;
-static int bitmap_height;
-static int bytes_per_pixel = 4;
 
-LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param);
-void resize_dib_section(int width, int height);
-void win32_update_window(HDC device_context, RECT *window_rect, int x, int y, int width, int height);
-void render_something(int x, int y);
+typedef struct Win32OffScreenBuffer{
+	BITMAPINFO info;
+	void *memory;
+	int width;
+	int height;
+	int pitch;
+	int bytes_per_pixel;
+} Win32OffScreenBuffer;
 
-int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int show_code) {
+typedef struct Win32WindowDimension {
+	int width;
+	int height;
+} Win32WindowDimension;
+
+/* XInput GetState*/
+#define X_INPUT_GET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_STATE *pState)
+typedef X_INPUT_GET_STATE(x_input_get_state);
+X_INPUT_GET_STATE(XInputGetStateStub) {
+	return 0;
+}
+static x_input_get_state *XInputGetState_ = XInputGetStateStub;
+#define XInputGetState XInputGetState_
+
+/* XInput SetState*/
+#define X_INPUT_SET_STATE(name) DWORD WINAPI name(DWORD dwUserIndex, XINPUT_VIBRATION *pVibration)
+typedef X_INPUT_SET_STATE(x_input_set_state);
+X_INPUT_SET_STATE(XInputSetStateStub) {
+	return 0;
+}
+static x_input_set_state *XInputSetState_ = XInputSetStateStub;
+#define XInputSetState XInputSetState_
+
+static LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param);
+static void resize_dib_section(Win32OffScreenBuffer *buffer, int width, int height);
+static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer buffer, int x, int y, int width, int height);
+static void render_something(Win32OffScreenBuffer buffer, int x, int y);
+static Win32WindowDimension get_window_dimension(HWND window);
+static void load_x_input();
+
+/* Global variables */
+static Win32OffScreenBuffer buffer;
+/* Global variables */
+
+static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int show_code) {
+	load_x_input();
+
 	WNDCLASS window_class = {};
-	window_class.style = CS_OWNDC|CS_HREDRAW|CS_VREDRAW;
+	window_class.style = CS_HREDRAW|CS_VREDRAW;
 	window_class.lpfnWndProc = win32_main_window_callback;
 	window_class.hInstance = instance;
 	window_class.lpszClassName = "AkashWindowClass";
 
 	if(RegisterClass(&window_class)) {
-		HWND window_handle = CreateWindowEx(0, window_class.lpszClassName, "AkashWindowClass",
-																				WS_OVERLAPPEDWINDOW|WS_VISIBLE, CW_USEDEFAULT,
-																				CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0,
-																				0, instance, 0);
+		HWND window_handle = CreateWindowEx(0, window_class.lpszClassName, "AkashWindowClass", WS_OVERLAPPEDWINDOW|WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0, 0, instance, 0);
+		resize_dib_section(&buffer, 800, 600);
 
 		if(window_handle) {
 			int x_offset = 0;
@@ -48,17 +82,45 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_li
 					DispatchMessage(&msg);
 				}
 
-				render_something(x_offset, 0);
+				for(DWORD controller_index = 0; controller_index < XUSER_MAX_COUNT; ++controller_index) {
+					XINPUT_STATE controller_state;
+					if(XInputGetState(controller_index, &controller_state) == ERROR_SUCCESS) {
+						XINPUT_GAMEPAD *pad = &controller_state.Gamepad;
+						bool d_pad_up = (pad->wButtons & XINPUT_GAMEPAD_DPAD_UP);
+						bool d_pad_down = (pad->wButtons & XINPUT_GAMEPAD_DPAD_DOWN);
+						bool d_pad_left = (pad->wButtons & XINPUT_GAMEPAD_DPAD_LEFT);
+						bool d_pad_right = (pad->wButtons & XINPUT_GAMEPAD_DPAD_RIGHT);
+						bool start = (pad->wButtons & XINPUT_GAMEPAD_START);
+						bool back = (pad->wButtons & XINPUT_GAMEPAD_BACK);
+						bool left_shoulder = (pad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER);
+						bool right_shoulder = (pad->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER);
+						bool a_button = (pad->wButtons & XINPUT_GAMEPAD_A);
+						bool b_button = (pad->wButtons & XINPUT_GAMEPAD_B);
+						bool x_button = (pad->wButtons & XINPUT_GAMEPAD_X);
+						bool y_button = (pad->wButtons & XINPUT_GAMEPAD_Y);
 
-				RECT client_rect;
-				GetClientRect(window_handle, &client_rect);
-				LONG window_width = client_rect.bottom - client_rect.top;
-				LONG window_height = client_rect.right - client_rect.left;
+						if(x_button) {
+							x_offset += 1;
+						}
+						else if(a_button) {
+							running = false;
+						}
+
+						int16 stick_x = pad->sThumbLX;
+						int16 stick_y = pad->sThumbLY;
+					}
+					else {
+						// controller not plugged in.
+					}
+				}
+
+				render_something(buffer, x_offset, 0);
+
+				Win32WindowDimension win32_window_dimension = get_window_dimension(window_handle);
 				HDC device_context = GetDC(window_handle);
-				win32_update_window(device_context, &client_rect, 0, 0, window_width, window_height);
+				win32_update_window(device_context, win32_window_dimension.width, win32_window_dimension.height, buffer, 0, 0, win32_window_dimension.width, win32_window_dimension.height);
 				ReleaseDC(window_handle, device_context);
 
-				x_offset += 1;
 			}
 		}
 	}
@@ -66,33 +128,37 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_li
 	return 0;
 }
 
-LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
+static LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param) {
 	LRESULT l_result = 0;
 
-	switch(message) 
-	{
+	switch(message) {
 		case WM_SIZE:
-			{
-				RECT client_rect;
-				GetClientRect(window, &client_rect);
-				int width = client_rect.right - client_rect.left;
-				int height = client_rect.bottom - client_rect.top;
-				resize_dib_section(width, height);
-			} 
 			break;
 		case WM_DESTROY:
-			{
-				running = false;
-			} 
+			running = false;
 			break;
 		case WM_CLOSE:
-			{
-				running = false;
-			}
+			running = false;
 			break;
 		case WM_ACTIVATEAPP:
+			OutputDebugStringA("WM_ACTIVATEAPP");
+			break;
+		case WM_SYSKEYDOWN:
+		case WM_SYSKEYUP:
+		case WM_KEYDOWN:
+		case WM_KEYUP:
 			{
-				OutputDebugStringA("WM_ACTIVATEAPP");
+				uint32 v_key_code = w_param;
+				bool was_down = ((l_param & (1 << 30)) != 0);
+				bool is_down = ((l_param & (1 << 31)) == 0);
+
+				if(is_down != was_down) {
+					if(v_key_code == 27) {
+						if(is_down) {
+							running = false;
+						}
+					}
+				}
 			}
 			break;
 		case WM_PAINT: 
@@ -100,69 +166,79 @@ LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_
 				PAINTSTRUCT paint;
 				HDC device_context = BeginPaint(window, &paint);
 				EndPaint(window, &paint);
+				break;
 			}
-			break;
 		default: 
-			{
-				OutputDebugStringA("default");
-				l_result = DefWindowProc(window, message, w_param, l_param);
-			}
+			l_result = DefWindowProc(window, message, w_param, l_param);
 	}
 
 	return l_result;
 }
 
-void resize_dib_section(int width, int height) {
-	if(bitmap_memory) {
-		VirtualFree(bitmap_memory, 0, MEM_RELEASE);
+static void resize_dib_section(Win32OffScreenBuffer *buffer, int width, int height) {
+	if(buffer->memory) {
+		VirtualFree(buffer->memory, 0, MEM_RELEASE);
 	}
 
-	bitmap_width = width;
-	bitmap_height = height;
+	buffer->width = width;
+	buffer->height = height;
 
-	bitmap_info.bmiHeader.biSize = sizeof(bitmap_info.bmiHeader);
-	bitmap_info.bmiHeader.biWidth = bitmap_width;
-	bitmap_info.bmiHeader.biHeight = -bitmap_height;
-	bitmap_info.bmiHeader.biPlanes = 1;
-	bitmap_info.bmiHeader.biBitCount = 32;
-	bitmap_info.bmiHeader.biCompression = BI_RGB;
-	bitmap_info.bmiHeader.biSizeImage = 0;
-	bitmap_info.bmiHeader.biXPelsPerMeter = 0;
-	bitmap_info.bmiHeader.biYPelsPerMeter = 0;
-	bitmap_info.bmiHeader.biClrUsed = 0;
-	bitmap_info.bmiHeader.biClrImportant = 0;
+	buffer->info.bmiHeader.biSize = sizeof(buffer->info.bmiHeader);
+	buffer->info.bmiHeader.biWidth = buffer->width;
+	buffer->info.bmiHeader.biHeight = -buffer->height;
+	buffer->info.bmiHeader.biPlanes = 1;
+	buffer->info.bmiHeader.biBitCount = 32;
+	buffer->info.bmiHeader.biCompression = BI_RGB;
+	buffer->info.bmiHeader.biSizeImage = 0;
+	buffer->info.bmiHeader.biXPelsPerMeter = 0;
+	buffer->info.bmiHeader.biYPelsPerMeter = 0;
+	buffer->info.bmiHeader.biClrUsed = 0;
+	buffer->info.bmiHeader.biClrImportant = 0;
 
-	int bitmap_memory_size = bitmap_width * bitmap_height * bytes_per_pixel;
-	bitmap_memory = VirtualAlloc(0, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
-	render_something(0, 0);
+	buffer->bytes_per_pixel = 4;
+	int bitmap_memory_size = buffer->width * buffer->height * buffer->bytes_per_pixel;
+	buffer->memory = VirtualAlloc(0, bitmap_memory_size, MEM_COMMIT, PAGE_READWRITE);
+	buffer->pitch = width * buffer->bytes_per_pixel;
 }
 
-void win32_update_window(HDC device_context, RECT *window_rect, int x, int y, int width, int height) {
-	int window_width = window_rect->right - window_rect->left;
-	int window_height = window_rect->bottom- window_rect->top;
-
-	StretchDIBits(device_context, 0, 0, bitmap_width, bitmap_height, 0, 0, window_width, window_height,
-			bitmap_memory, &bitmap_info, DIB_RGB_COLORS, SRCCOPY);
+static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer buffer, int x, int y, int width, int height) {
+	StretchDIBits(device_context, 0, 0, window_width, window_height, 0, 0, buffer.width, buffer.height, buffer.memory, &buffer.info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-void render_something(int x, int y) {
-	int width = bitmap_width;
-	int height = bitmap_height;
-	int pitch = width * bytes_per_pixel;
+static void render_something(Win32OffScreenBuffer buffer, int x, int y) {
+	int width = buffer.width;
+	int height = buffer.height;
 
-	/* XXRRGGBB */
-	uint8* row = (uint8*) bitmap_memory;
-	for(int i = 0; i < bitmap_height; ++i) {
-		uint8* pixel = (uint8*) row;
-		for(int j = 0; j < bitmap_width; ++j) {
-			pixel[0] = (uint8)i + y;
-			pixel[1] = (uint8)j + x;
-			pixel[2] = 0;
-			pixel[3] = 0;
-
-			pixel += 4;
+	// Register: xx RR GG BB 
+	// Memory  : BB GG RR xx
+	uint8* row = (uint8*) buffer.memory;
+	for(int i = 0; i < height; ++i) {
+		uint32* pixel = (uint32*) row;
+		for(int j = 0; j < width; ++j) {
+			uint8 green = j + x;
+			uint8 blue = i + y;
+			*pixel = ((green << 16) | (blue << 8)) | blue;
+			pixel += 1;
 		}
 
-		row += pitch;
+		row += buffer.pitch;
+	}
+}
+
+static Win32WindowDimension get_window_dimension(HWND window) {
+	RECT client_rect;
+	GetClientRect(window, &client_rect);
+	Win32WindowDimension win32_window_dimension;
+	win32_window_dimension.width = client_rect.right - client_rect.left;
+	win32_window_dimension.height = client_rect.bottom - client_rect.top;
+
+	return win32_window_dimension;
+}
+
+static void load_x_input() {
+	HMODULE x_input_library = LoadLibrary("xinput1_3.dll");
+	if(x_input_library) {
+		XInputGetState = (x_input_get_state*) GetProcAddress(x_input_library, "XInputGetState");
+		XInputSetState = (x_input_set_state*) GetProcAddress(x_input_library, "XInputSetState");
 	}
 }
