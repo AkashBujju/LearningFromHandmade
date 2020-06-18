@@ -3,6 +3,7 @@
 #include <xinput.h>
 #include <dsound.h>
 #include <math.h>
+#include <stdio.h> /* @tmp @debug */
 
 #define PI32 3.1459265359f
 
@@ -16,6 +17,8 @@ typedef int32_t int32;
 typedef int64_t int64;
 typedef float real32;
 typedef double real64;
+
+#include "handmade.cpp"
 
 static bool running;
 
@@ -70,19 +73,22 @@ typedef DIRECT_SOUND_CREATE(direct_sound_create);
 static LRESULT CALLBACK win32_main_window_callback(HWND window, UINT message, WPARAM w_param, LPARAM l_param);
 static void resize_dib_section(Win32OffScreenBuffer *buffer, int width, int height);
 static void win32_update_window(HDC device_context, int window_width, int window_height, Win32OffScreenBuffer *buffer, int x, int y, int width, int height);
-static void render_something(Win32OffScreenBuffer *buffer, int x, int y);
 static Win32WindowDimension get_window_dimension(HWND window);
 static void load_x_input();
-static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size);
+static void win32_init_sound(HWND window, int32 samples_per_sec, int32 buffer_size);
 static void win32_fill_sound_buffer(Win32SoundOutput *win32_sound_output, DWORD byte_to_lock, DWORD bytes_to_write);
 /* Functions */
 
 /* Global variables */
-static Win32OffScreenBuffer buffer;
+static Win32OffScreenBuffer back_buffer;
 static LPDIRECTSOUNDBUFFER secondary_buffer;
 /* Global variables */
 
 static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR command_line, int show_code) {
+	LARGE_INTEGER perf_count_frequency_result;
+	QueryPerformanceFrequency(&perf_count_frequency_result);
+	int64 perf_count_frequency = perf_count_frequency_result.QuadPart;
+
 	load_x_input();
 
 	WNDCLASSA window_class = {};
@@ -93,7 +99,7 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 
 	if(RegisterClass(&window_class)) {
 		HWND window_handle = CreateWindowEx(0, window_class.lpszClassName, "AkashWindowClass", WS_OVERLAPPEDWINDOW|WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, 0, 0, instance, 0);
-		resize_dib_section(&buffer, 800, 600);
+		resize_dib_section(&back_buffer, 800, 600);
 
 		if(window_handle) {
 			MSG msg;
@@ -113,11 +119,15 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 				win32_sound_output.bytes_per_sample = sizeof(int16) * 2;
 				win32_sound_output.secondary_buffer_size = win32_sound_output.samples_per_second * win32_sound_output.bytes_per_sample;
 				win32_sound_output.tone_volume = 16000;
-				Win32InitSound(window_handle, win32_sound_output.samples_per_second, win32_sound_output.secondary_buffer_size);
+				win32_init_sound(window_handle, win32_sound_output.samples_per_second, win32_sound_output.secondary_buffer_size);
 				win32_fill_sound_buffer(&win32_sound_output, 0, win32_sound_output.secondary_buffer_size);
 				secondary_buffer->Play(0, 0, DSBPLAY_LOOPING);
 			}
 			/* Sound test */
+
+			LARGE_INTEGER last_counter;
+			QueryPerformanceCounter(&last_counter);
+			int64 last_cycle_count = __rdtsc();
 
 			while(running) {
 				while(PeekMessage(&msg, 0, 0, 0, PM_REMOVE)) {
@@ -160,7 +170,12 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 					}
 				}
 
-				render_something(&buffer, x_offset, 0);
+				GameOffScreenBuffer game_offscreen_buffer;
+				game_offscreen_buffer.memory = back_buffer.memory;
+				game_offscreen_buffer.width = back_buffer.width;
+				game_offscreen_buffer.height = back_buffer.height;
+				game_offscreen_buffer.pitch = back_buffer.pitch;
+				game_update_and_render(&game_offscreen_buffer);
 
 				/* DirectSound test */
 				{
@@ -169,17 +184,14 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 					if(SUCCEEDED(secondary_buffer->GetCurrentPosition(&play_cursor, &write_cursor))) {
 						DWORD byte_to_lock = (win32_sound_output.running_sample_index * win32_sound_output.bytes_per_sample) % win32_sound_output.secondary_buffer_size;
 						DWORD bytes_to_write;
-						if(byte_to_lock == play_cursor) {
-							bytes_to_write = 0;
-						}
-						else if(byte_to_lock > play_cursor) {
+						if(byte_to_lock > play_cursor) {
 							bytes_to_write = win32_sound_output.secondary_buffer_size - byte_to_lock;
 							bytes_to_write += play_cursor;
 						}
 						else {
 							bytes_to_write = play_cursor - byte_to_lock;
 						}
-					
+
 						win32_fill_sound_buffer(&win32_sound_output, byte_to_lock, bytes_to_write);
 					}
 				}
@@ -187,12 +199,32 @@ static int WINAPI WinMain(HINSTANCE instance, HINSTANCE prev_instance, LPSTR com
 
 				Win32WindowDimension win32_window_dimension = get_window_dimension(window_handle);
 				HDC device_context = GetDC(window_handle);
-				win32_update_window(device_context, win32_window_dimension.width, win32_window_dimension.height, &buffer, 0, 0, win32_window_dimension.width, win32_window_dimension.height);
+				win32_update_window(device_context, win32_window_dimension.width, win32_window_dimension.height, &back_buffer, 0, 0, win32_window_dimension.width, win32_window_dimension.height);
 				ReleaseDC(window_handle, device_context);
+
+				int64 end_cycle_count = __rdtsc();
+				LARGE_INTEGER end_counter;
+				QueryPerformanceCounter(&end_counter);
+
+				real64 cycles_elapsed = end_cycle_count - last_cycle_count;
+				real64 counter_elapsed = end_counter.QuadPart - last_counter.QuadPart;
+				real32 ms_per_frame = (real32)((1000.0f * (real32)counter_elapsed) / (real32)perf_count_frequency);
+				real32 fps = 1000.0f / ms_per_frame; // OR perf_count_frequency / counter_elapsed.
+				real32 mega_cycles_per_frame = (real32)(((real32)cycles_elapsed) / (1000.0f * 1000.0f));
+				real32 giga_hertz = (fps * mega_cycles_per_frame) / 1000.0f;
+
+#if 0
+				char buffer[256];
+				sprintf(buffer, "-> %f(fps), %f(mega cycles), %f(speed)\n", fps, mega_cycles_per_frame, giga_hertz);
+				OutputDebugStringA(buffer);
+#endif
+
+				last_counter = end_counter;
+				last_cycle_count = end_cycle_count;
 			}
 		}
 	}
-	
+
 	return 0;
 }
 
@@ -273,26 +305,6 @@ static void win32_update_window(HDC device_context, int window_width, int window
 	StretchDIBits(device_context, 0, 0, window_width, window_height, 0, 0, buffer->width, buffer->height, buffer->memory, &buffer->info, DIB_RGB_COLORS, SRCCOPY);
 }
 
-static void render_something(Win32OffScreenBuffer *buffer, int x, int y) {
-	int width = buffer->width;
-	int height = buffer->height;
-
-	// Register: xx RR GG BB 
-	// Memory  : BB GG RR xx
-	uint8* row = (uint8*) buffer->memory;
-	for(int i = 0; i < height; ++i) {
-		uint32* pixel = (uint32*) row;
-		for(int j = 0; j < width; ++j) {
-			uint8 green = j + x;
-			uint8 blue = i + y;
-			*pixel = ((green << 16) | (blue << 8)) | blue;
-			pixel += 1;
-		}
-
-		row += buffer->pitch;
-	}
-}
-
 static Win32WindowDimension get_window_dimension(HWND window) {
 	RECT client_rect;
 	GetClientRect(window, &client_rect);
@@ -315,7 +327,7 @@ static void load_x_input() {
 	}
 }
 
-static void Win32InitSound(HWND window, int32 samples_per_sec, int32 buffer_size) {
+static void win32_init_sound(HWND window, int32 samples_per_sec, int32 buffer_size) {
 	/* Load the library. */
 	HMODULE d_sound_library = LoadLibraryA("dsound.dll");
 
@@ -376,8 +388,7 @@ static void win32_fill_sound_buffer(Win32SoundOutput *win32_sound_output, DWORD 
 	void *region_1, *region_2;
 	DWORD region_1_size, region_2_size;
 
-	if(SUCCEEDED(secondary_buffer->Lock(byte_to_lock, bytes_to_write, &region_1, &region_1_size, &region_2, &region_2_size, 0)))
-	{
+	if(SUCCEEDED(secondary_buffer->Lock(byte_to_lock, bytes_to_write, &region_1, &region_1_size, &region_2, &region_2_size, 0))) {
 		int16* sample_out;
 
 		sample_out = (int16*) region_1;
